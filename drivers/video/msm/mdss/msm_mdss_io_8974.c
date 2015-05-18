@@ -489,7 +489,36 @@ static int mdss_dsi_enable_clks(struct mdss_dsi_ctrl_pdata *ctrl)
 				goto error;
 			}
 
-			rc = mdss_dsi_clk_set_rate(ctrl);
+		rc = mdss_dsi_bus_clk_start(ctrl);
+		if (rc) {
+			pr_err("%s: Failed to start bus clocks. rc=%d\n",
+				__func__, rc);
+			goto error_bus_clk_start;
+		}
+
+		/*
+		 * Phy software reset should not be done for idle screen power
+		 * collapse use-case. Issue a phy software reset only when
+		 * unblanking the panel.
+		 */
+		if (pdata->panel_info.blank_state == MDSS_PANEL_BLANK_BLANK)
+			mdss_dsi_phy_sw_reset(ctrl->ctrl_base);
+		mdss_dsi_phy_init(pdata);
+
+		mdss_dsi_ctrl_setup(pdata);
+
+		if (ctrl->ulps) {
+			/*
+			 * ULPS Entry Request. This is needed if the lanes were
+			 * in ULPS prior to power collapse, since after
+			 * power collapse and reset, the DSI controller resets
+			 * back to idle state and not ULPS. This ulps entry
+			 * request will transition the state of the DSI
+			 * controller to ULPS which will match the state of the
+			 * DSI phy. This needs to be done prior to disabling
+			 * the DSI clamps.
+			 */
+			rc = mdss_dsi_ulps_config(ctrl, 1);
 			if (rc) {
 				pr_err("%s: failed to set clk rates. rc=%d\n",
 					__func__, rc);
@@ -497,9 +526,18 @@ static int mdss_dsi_enable_clks(struct mdss_dsi_ctrl_pdata *ctrl)
 				goto error;
 			}
 
-			rc = mdss_dsi_clk_prepare(ctrl);
-			if (rc) {
-				pr_err("%s: failed to prepare clks. rc=%d\n",
+		rc = mdss_dsi_clamp_ctrl(ctrl, 0);
+		if (rc) {
+			pr_err("%s: Failed to disable dsi clamps. rc=%d\n",
+				__func__, rc);
+			goto error_ulps;
+		}
+	} else {
+		/* Enable DSI clamps only if entering idle power collapse */
+		if (pdata->panel_info.blank_state != MDSS_PANEL_BLANK_BLANK) {
+			rc = mdss_dsi_clamp_ctrl(ctrl, 1);
+			if (rc)
+				pr_err("%s: Failed to enable dsi clamps. rc=%d\n",
 					__func__, rc);
 				mdss_dsi_disable_bus_clocks(ctrl);
 				goto error;
@@ -554,27 +592,23 @@ int mdss_dsi_clk_ctrl(struct mdss_dsi_ctrl_pdata *ctrl, int enable)
 				ctrl->ndx, left_ctrl->clk_cnt, right_ctrl_pdata->clk_cnt); 
 #endif
 	} else {
-#ifdef DSI_CLK_DEBUG
-		pr_err("[QCT_TEST] disable ++ : %d , (%d) (%d)\n",
-				ctrl->ndx, left_ctrl->clk_cnt, right_ctrl_pdata->clk_cnt); 
-#endif
-		if (ctrl->clk_cnt) {
-			ctrl->clk_cnt--;
-			if (ctrl->clk_cnt == 0) {
-				if (ctrl->ndx == DSI_CTRL_1 &&
-					ctrl->shared_pdata.broadcast_enable) {					
-					if(left_ctrl->clk_cnt){
-						left_ctrl->clk_cnt--;
-						if(!left_ctrl->clk_cnt){
-							mdss_dsi_clk_disable(left_ctrl);
-							mdss_dsi_clk_unprepare(left_ctrl);
-							mdss_dsi_disable_bus_clocks(left_ctrl);							
-						}
-					}									
-				}			
-				mdss_dsi_clk_disable(ctrl);
-				mdss_dsi_clk_unprepare(ctrl);
-				mdss_dsi_disable_bus_clocks(ctrl);
+		if (clk_type & DSI_LINK_CLKS) {
+			/*
+			 * If ULPS feature is enabled, enter ULPS first.
+			 * No need to enable ULPS when turning off clocks
+			 * while blanking the panel.
+			 */
+			if ((mdss_dsi_ulps_feature_enabled(pdata)) &&
+				(pdata->panel_info.blank_state !=
+				 MDSS_PANEL_BLANK_BLANK))
+				mdss_dsi_ulps_config(ctrl, 1);
+			mdss_dsi_link_clk_stop(ctrl);
+		}
+		if (clk_type & DSI_BUS_CLKS) {
+			rc = mdss_dsi_core_power_ctrl(ctrl, enable);
+			if (rc) {
+				pr_err("%s: Failed to disable core power. rc=%d\n",
+					__func__, rc);
 			}
 		}
 #ifdef DSI_CLK_DEBUG

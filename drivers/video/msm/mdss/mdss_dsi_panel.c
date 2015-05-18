@@ -47,7 +47,521 @@ static struct mdss_dsi_driver_data msd;
 
 DEFINE_LED_TRIGGER(bl_led_trigger);
 
-/*static struct mdss_dsi_phy_ctrl phy_params;*/
+#ifdef CONFIG_MACH_OPPO
+extern int lm3630_bank_a_update_status(u32 bl_level);
+
+/* Xiaori.Yuan@Mobile Phone Software Dept.Driver, 2014/02/17  Add for set cabc */
+static struct dsi_panel_cmds cabc_off_sequence;
+static struct dsi_panel_cmds cabc_user_interface_image_sequence;
+static struct dsi_panel_cmds cabc_still_image_sequence;
+static struct dsi_panel_cmds cabc_video_image_sequence;
+static struct dsi_panel_cmds cabc_sre_sequence;
+
+static struct dsi_panel_cmds gamma1;
+static struct dsi_panel_cmds gamma2;
+static struct dsi_panel_cmds gamma3;
+static struct dsi_panel_cmds gamma4;
+
+static struct dsi_panel_cmds color_enhance_on_sequence;
+static struct dsi_panel_cmds color_enhance_off_sequence;
+
+static void mdss_dsi_panel_cmds_send(struct mdss_dsi_ctrl_pdata *ctrl,
+			struct dsi_panel_cmds *pcmds);
+
+extern int set_backlight_pwm(int state);
+
+enum
+{
+	CABC_CLOSE = 0,
+	CABC_LOW_MODE,
+	CABC_MIDDLE_MODE,
+	CABC_HIGH_MODE,
+
+};
+
+static DEFINE_MUTEX(config_mutex);
+static int mdss_dsi_update_cabc_level(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
+{
+	int ret = 0;
+	struct mdss_panel_info *pinfo = NULL;
+
+    if (ctrl_pdata == NULL) {
+	    pr_err("%s: Invalid input data\n", __func__);
+	    return -EINVAL;
+    }
+
+	pinfo = &(ctrl_pdata->panel_data.panel_info);
+
+    if (!pinfo->cabc_available)
+        goto done;
+
+	pr_info("%s: update cabc level=%d (%d) sre=%d (%d)", __func__,
+			pinfo->cabc_mode, pinfo->cabc_active,
+			pinfo->sre_enabled, pinfo->sre_active);
+
+	switch (pinfo->cabc_mode)
+	{
+		case 0:
+			mdss_dsi_panel_cmds_send(ctrl_pdata, &cabc_off_sequence);
+			break;
+		case 1:
+			if (pinfo->sre_available && pinfo->sre_active)
+				mdss_dsi_panel_cmds_send(ctrl_pdata, &cabc_sre_sequence);
+			else if (pinfo->cabc_bl_max > 0 && !pinfo->cabc_active)
+				mdss_dsi_panel_cmds_send(ctrl_pdata, &cabc_off_sequence);
+			else
+				mdss_dsi_panel_cmds_send(ctrl_pdata, &cabc_user_interface_image_sequence);
+			break;
+		case 2:
+			mdss_dsi_panel_cmds_send(ctrl_pdata, &cabc_still_image_sequence);
+			break;
+		case 3:
+			mdss_dsi_panel_cmds_send(ctrl_pdata, &cabc_video_image_sequence);
+			break;
+		default:
+			pr_err("%s: cabc level %d is not supported!\n",__func__, pinfo->cabc_mode);
+			ret = -EINVAL;
+			break;
+	}
+
+done:
+	set_backlight_pwm((pinfo->cabc_available && (pinfo->cabc_mode > 0)) ? 1 : 0);
+
+	return ret;
+}
+
+int mdss_dsi_panel_set_cabc(struct mdss_panel_data *pdata, int level)
+{
+	int ret = 0;
+	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
+	struct mdss_panel_info *pinfo = NULL;
+
+    if (pdata == NULL) {
+	    pr_err("%s: Invalid input data\n", __func__);
+	    return -EINVAL;
+    }
+
+    ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata, panel_data);
+	pinfo = &(ctrl_pdata->panel_data.panel_info);
+
+    if (!pinfo->cabc_available)
+        return 0;
+
+	mutex_lock(&config_mutex);
+
+	if (level < 0 || level > 3) {
+		pr_err("%s: valid cabc values are 0-4\n", __func__);
+		goto out;
+	}
+
+	pinfo->cabc_mode = level;
+
+	if (pinfo->panel_power_state != MDSS_PANEL_POWER_ON) {
+		pr_info("%s: lcd is off, queued cabc change\n", __func__);
+		goto out;
+	}
+
+	ret = mdss_dsi_update_cabc_level(ctrl_pdata);
+
+out:
+	mutex_unlock(&config_mutex);
+	return ret;
+
+}
+
+int mdss_dsi_panel_update_sre(struct mdss_panel_data *pdata, u32 bl_level)
+{
+	int ret = 0;
+	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
+	struct mdss_panel_info *pinfo = NULL;
+
+	if (pdata == NULL)
+		return -EINVAL;
+
+	ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata, panel_data);
+	pinfo = &(ctrl_pdata->panel_data.panel_info);
+
+	if (!pinfo->cabc_mode || !pinfo->cabc_bl_max || !pinfo->sre_bl_threshold)
+		return 0;
+
+	// disable CABC above some backlight value since it's not effective at high
+	// brightness. optionally enable SRE when it's even higher to melt faces off.
+	if ((!pinfo->cabc_active || pinfo->sre_active) && bl_level <= pinfo->cabc_bl_max) {
+		pinfo->cabc_active = true;
+		pinfo->sre_active = false;
+		ret = mdss_dsi_update_cabc_level(ctrl_pdata);
+	} else if (bl_level > pinfo->cabc_bl_max) {
+		if (pinfo->sre_enabled && !pinfo->sre_active && bl_level >= pinfo->sre_bl_threshold) {
+			pinfo->cabc_active = false;
+			pinfo->sre_active = true;
+			ret = mdss_dsi_update_cabc_level(ctrl_pdata);
+		} else if (pinfo->cabc_active || pinfo->sre_active) {
+			pinfo->cabc_active = false;
+			pinfo->sre_active = false;
+			ret = mdss_dsi_update_cabc_level(ctrl_pdata);
+		}
+	}
+	return ret;
+}
+
+int mdss_dsi_panel_set_sre(struct mdss_panel_data *pdata, bool enable)
+{
+	int ret = 0;
+	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
+	struct mdss_panel_info *pinfo = NULL;
+
+    if (pdata == NULL) {
+	    pr_err("%s: Invalid input data\n", __func__);
+	    return -EINVAL;
+    }
+
+    ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata, panel_data);
+	pinfo = &(ctrl_pdata->panel_data.panel_info);
+
+    if (!pinfo->cabc_available || !pinfo->sre_available ||
+            enable == pinfo->sre_enabled)
+        return 0;
+
+	mutex_lock(&config_mutex);
+	pinfo->sre_enabled = enable;
+	pinfo->sre_active = false;
+	mutex_unlock(&config_mutex);
+
+	return ret;
+}
+
+static int mdss_dsi_update_color_enhance(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
+{
+	struct mdss_panel_info *pinfo = NULL;
+
+	if (ctrl_pdata == NULL) {
+		pr_err("%s: Invalid input data\n", __func__);
+		return -EINVAL;
+	}
+
+	pinfo = &(ctrl_pdata->panel_data.panel_info);
+
+	if (!pinfo->color_enhance_available)
+		return -EINVAL;
+
+	pr_info("%s: enabled = %d", __func__, pinfo->color_enhance_enabled);
+
+	mdss_dsi_panel_cmds_send(ctrl_pdata, pinfo->color_enhance_enabled ?
+			&color_enhance_on_sequence : &color_enhance_off_sequence);
+
+	return 0;
+}
+
+int mdss_dsi_panel_set_color_enhance(struct mdss_panel_data *pdata, bool enabled)
+{
+	int ret = 0;
+	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
+	struct mdss_panel_info *pinfo = NULL;
+
+	if (pdata == NULL) {
+		pr_err("%s: Invalid input data\n", __func__);
+		return -EINVAL;
+	}
+
+	ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata, panel_data);
+	pinfo = &(ctrl_pdata->panel_data.panel_info);
+
+	if (!pinfo->color_enhance_available)
+		return -EINVAL;
+
+    mutex_lock(&config_mutex);
+
+	pinfo->color_enhance_enabled = enabled;
+
+	if (pinfo->panel_power_state != MDSS_PANEL_POWER_ON) {
+		pr_info("%s: lcd is off, queued color enhance change\n", __func__);
+		goto out;
+	}
+
+	ret = mdss_dsi_update_color_enhance(ctrl_pdata);
+
+out:
+    mutex_unlock(&config_mutex);
+	return ret;
+}
+
+static int mdss_dsi_update_gamma_index(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
+{
+	int ret = 0;
+	struct mdss_panel_info *pinfo = NULL;
+
+	if (ctrl_pdata == NULL) {
+		pr_err("%s: Invalid input data\n", __func__);
+		return -EINVAL;
+	}
+
+	pinfo = &(ctrl_pdata->panel_data.panel_info);
+
+	if (!pinfo->gamma_count)
+		return -EINVAL;
+
+
+	if (pinfo->gamma_index < 0 || pinfo->gamma_index >= pinfo->gamma_count) {
+		return -EINVAL;
+	}
+
+	pr_info("%s: update gamma index=%d", __func__, pinfo->gamma_index);
+
+	switch (pinfo->gamma_index)
+	{
+		case 0:
+			 mdss_dsi_panel_cmds_send(ctrl_pdata, &gamma1);
+			 break;
+		case 1:
+			 mdss_dsi_panel_cmds_send(ctrl_pdata, &gamma2);
+			 break;
+		case 2:
+			 mdss_dsi_panel_cmds_send(ctrl_pdata, &gamma3);
+			 break;
+		case 3:
+			 mdss_dsi_panel_cmds_send(ctrl_pdata, &gamma4);
+			 break;
+		default:
+			pr_err("%s : invalid gamma index %d yxr \n",__func__, pinfo->gamma_index);
+			ret = -EINVAL;
+			break;
+	}
+
+	return ret;
+}
+
+int mdss_dsi_panel_set_gamma_index(struct mdss_panel_data *pdata, int index)
+{
+	int ret = 0;
+	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
+	struct mdss_panel_info *pinfo = NULL;
+
+	if (pdata == NULL) {
+		pr_err("%s: Invalid input data\n", __func__);
+		return -EINVAL;
+	}
+
+	ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata, panel_data);
+	pinfo = &(ctrl_pdata->panel_data.panel_info);
+
+	if (!pinfo->gamma_count)
+		return -EINVAL;
+
+    mutex_lock(&config_mutex);
+
+    if(index < 0 || index >= pinfo->gamma_count) {
+		pr_err("%s: valid gamma indexes are 0-%d\n", __func__,
+				(pinfo->gamma_count - 1));
+        goto out;
+    }
+
+	pinfo->gamma_index = index;
+
+	if (pinfo->panel_power_state != MDSS_PANEL_POWER_ON) {
+		pr_info("%s: lcd is off, queued gamma change\n", __func__);
+		goto out;
+	}
+
+	ret = mdss_dsi_update_gamma_index(ctrl_pdata);
+
+out:
+    mutex_unlock(&config_mutex);
+	return ret;
+}
+
+int mdss_dsi_panel_get_panel_calibration(
+	struct mdss_panel_data *pdata, char *buf)
+{
+	struct mdss_dsi_ctrl_pdata *ctrl = NULL;
+	struct dsi_panel_cmds *ccmds = NULL;
+	ssize_t len = 0;
+	int i, j;
+
+	if (pdata == NULL) {
+		pr_err("%s: Invalid input data\n", __func__);
+		return -EINVAL;
+	}
+
+	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
+				panel_data);
+
+	// Make sure there's initialized calibration data to read
+	if (!ctrl->calibration_available || !ctrl->calibration_cmds.cmds)
+		return -ENODEV;
+
+
+	mutex_lock(&config_mutex);
+
+	ccmds = &ctrl->calibration_cmds;
+	for (i = 1; i < ccmds->cmd_cnt - 1; i++) {
+		for (j = 0; j < ccmds->cmds[i].dchdr.dlen; j++)
+			len += sprintf(buf + len, "%02x ", ccmds->cmds[i].payload[j]);
+		sprintf(buf + len - 1, "\n");
+	}
+
+	mutex_unlock(&config_mutex);
+
+	return len;
+}
+
+
+static void mdss_dsi_panel_apply_panel_calibration(
+	struct mdss_panel_data *pdata,	struct mdss_dsi_ctrl_pdata *ctrl)
+{
+	pr_debug("%s: Apply panel calibration\n", __func__);
+	if (pdata->panel_info.panel_power_state == MDSS_PANEL_POWER_ON
+		&& ctrl->calibration_available
+		&& ctrl->calibration_cmds.cmds
+		&& ctrl->calibration_cmds.cmd_cnt > 2)
+		mdss_dsi_panel_cmds_send(ctrl, &ctrl->calibration_cmds);
+}
+
+#define PANEL_CALIBRATION_MAX_CMDS 16
+#define PANEL_CALIBRATION_MAX_VALS 64
+#define PANEL_CALIBRATION_DELIM "\n,"
+int mdss_dsi_panel_set_panel_calibration(struct mdss_panel_data *pdata,
+					const char *buf)
+{
+	struct mdss_dsi_ctrl_pdata *ctrl = NULL;
+	struct dsi_cmd_desc *cmds = NULL;
+	char *buf_cpy, *buf_cpy_ref, *token;
+	int i, cmd_no, new_cmd_cnt = 0;
+	unsigned char val = 0;
+
+	static char action_cmd[2] = { 0xb0, 0x04 };
+	static char end_cmd[2] = { 0x29, 0x00 };
+
+	// validate input length
+	if (strlen(buf) >
+		PANEL_CALIBRATION_MAX_CMDS * PANEL_CALIBRATION_MAX_VALS * 3) {
+		pr_err("%s: Invalid input, too long: %d, \n", __func__,
+			strlen(buf) );
+		return -EINVAL;
+	}
+
+	if (pdata == NULL) {
+		pr_err("%s: Invalid input data\n", __func__);
+		return -EINVAL;
+	}
+
+	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
+				panel_data);
+
+	// check if we're working on the right panel's framebuffer
+	if (!ctrl->calibration_available || !ctrl->calibration_cmds.cmds)
+		return -ENODEV;
+
+	pr_debug("%s: Set calibration string len: %d, content: %s\n",
+		__func__, strlen(buf), buf);
+
+	mutex_lock(&config_mutex);
+
+	// identify if we receive an apply-only command
+	if (strlen(buf) <= 2 && *buf == '1') {
+		mdss_dsi_panel_apply_panel_calibration(pdata, ctrl);
+		mutex_unlock(&config_mutex);
+		return 0;
+	}
+
+	// count the number of valid commands
+	buf_cpy = kstrdup(buf, GFP_KERNEL);
+	buf_cpy_ref = buf_cpy;
+	while ((token = strsep(&buf_cpy, PANEL_CALIBRATION_DELIM)) != NULL) {
+		if (token != NULL
+			&& sscanf(token, "%hhx %hhx", &val, &val) == 2)
+			new_cmd_cnt++;
+
+		if (new_cmd_cnt == PANEL_CALIBRATION_MAX_CMDS)
+			break;
+	}
+	kfree(buf_cpy_ref);
+
+	pr_debug("%s: Found %d command(s) on max: %d\n", __func__, new_cmd_cnt,
+			PANEL_CALIBRATION_MAX_VALS);
+
+	// allocate new command sequence
+	cmds = kzalloc((new_cmd_cnt + 2) * sizeof(struct dsi_cmd_desc),
+			GFP_KERNEL);
+
+	// fill sequence with commands
+	buf_cpy = kstrdup(buf, GFP_KERNEL);
+	buf_cpy_ref = buf_cpy;
+	cmd_no = 1;
+	i = 0;
+
+	while ((token = strsep(&buf_cpy, PANEL_CALIBRATION_DELIM)) != NULL) {
+		int read, pos = 0, len = 0;
+		char values[PANEL_CALIBRATION_MAX_VALS];
+		char *payload;
+		char *ref;
+
+		// validate token
+		if (token == NULL
+			|| sscanf(token, "%hhx %hhx", &val, &val) != 2)
+			continue;
+
+		ref = buf_cpy;
+		// read payload values
+		while (sscanf(token + pos, "%hhx%n", &val, &read) == 1) {
+			pos += read;
+			values[len] = val;
+			len++;
+
+			pr_debug("%s: calibration: [%d] value[%d]: %02x\n",
+				__func__, i, len, val);
+
+			if (len == PANEL_CALIBRATION_MAX_VALS)
+				break;
+		}
+		buf_cpy = ref;
+
+		payload = kmalloc(len, GFP_KERNEL);
+		memcpy(payload, values, len);
+
+		cmds[cmd_no].dchdr.dtype = DTYPE_GEN_LWRITE;
+		cmds[cmd_no].dchdr.last = 1;
+		cmds[cmd_no].dchdr.wait = 1;
+		cmds[cmd_no].dchdr.dlen = len;
+		cmds[cmd_no].payload = payload;
+		cmd_no++;
+		i++;
+	}
+	kfree(buf_cpy_ref);
+
+	// command sequence start
+	cmds[0].dchdr.dtype = DTYPE_GEN_WRITE2;
+	cmds[0].dchdr.last = 1;
+	cmds[0].dchdr.wait = 1;
+	cmds[0].dchdr.dlen = 2;
+	cmds[0].payload = kmalloc(2, GFP_KERNEL);
+	memcpy(cmds[0].payload, action_cmd, 2);
+
+	// command sequence end
+	cmds[cmd_no].dchdr.dtype = DTYPE_DCS_WRITE;
+	cmds[cmd_no].dchdr.last = 1;
+	cmds[cmd_no].dchdr.wait = 1;
+	cmds[cmd_no].dchdr.dlen = 2;
+	cmds[cmd_no].payload = kmalloc(2, GFP_KERNEL);
+	memcpy(cmds[cmd_no].payload, end_cmd, 2);
+
+	// free previous custom panel calibration sequence
+	for (i = 0; i < ctrl->calibration_cmds.cmd_cnt; i++)
+		if (!ctrl->calibration_cmds.blen)
+			kfree(ctrl->calibration_cmds.cmds[i].payload);
+	kfree(ctrl->calibration_cmds.cmds);
+
+	// set new commands
+	ctrl->calibration_cmds.cmd_cnt = new_cmd_cnt + 2;
+	ctrl->calibration_cmds.blen = 0;
+	ctrl->calibration_cmds.cmds = cmds;
+
+	// apply
+	mdss_dsi_panel_apply_panel_calibration(pdata, ctrl);
+	mutex_unlock(&config_mutex);
+
+	return 0;
+}
+#endif
 
 void mdss_dsi_panel_pwm_cfg(struct mdss_dsi_ctrl_pdata *ctrl)
 {
@@ -219,14 +733,30 @@ void mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 	pinfo = &(ctrl_pdata->panel_data.panel_info);
 
 	if (enable) {
-		if (gpio_is_valid(ctrl_pdata->disp_en_gpio))
-			gpio_set_value((ctrl_pdata->disp_en_gpio), 1);
+#ifdef CONFIG_MACH_OPPO
+		if (gpio_is_valid(ctrl_pdata->disp_en_gpio) &&
+				gpio_is_valid(ctrl_pdata->rst_gpio)) {
+#endif
+		rc = mdss_dsi_request_gpios(ctrl_pdata);
+		if (rc) {
+			pr_err("gpio request failed\n");
+			return rc;
+		}
+		if (!pinfo->cont_splash_enabled) {
+			if (gpio_is_valid(ctrl_pdata->disp_en_gpio))
+				gpio_set_value((ctrl_pdata->disp_en_gpio), 1);
 
-		for (i = 0; i < pdata->panel_info.rst_seq_len; ++i) {
-			gpio_set_value((ctrl_pdata->rst_gpio),
-				pdata->panel_info.rst_seq[i]);
-			if (pdata->panel_info.rst_seq[++i])
-				usleep(pdata->panel_info.rst_seq[i] * 1000);
+			for (i = 0; i < pdata->panel_info.rst_seq_len; ++i) {
+				gpio_set_value((ctrl_pdata->rst_gpio),
+					pdata->panel_info.rst_seq[i]);
+#ifdef CONFIG_MACH_OPPO
+				if (gpio_is_valid(ctrl_pdata->lcd_5v_en_gpio))
+					gpio_direction_output((ctrl_pdata->lcd_5v_en_gpio),
+							pdata->panel_info.rst_seq[i]);
+#endif
+				if (pdata->panel_info.rst_seq[++i])
+					usleep(pinfo->rst_seq[i] * 1000);
+			}
 		}
 
 		if (gpio_is_valid(ctrl_pdata->mode_gpio)) {
@@ -397,7 +927,6 @@ static int mdss_dsi_panel_event_handler(int event)
 
 static int mdss_dsi_panel_on(struct mdss_panel_data *pdata)
 {
-	struct mipi_panel_info *mipi;
 	struct mdss_dsi_ctrl_pdata *ctrl = NULL;
 
 	if (pdata == NULL) {
@@ -405,22 +934,38 @@ static int mdss_dsi_panel_on(struct mdss_panel_data *pdata)
 		return -EINVAL;
 	}
 
+	pinfo = &pdata->panel_info;
 	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
-	mipi  = &pdata->panel_info.mipi;
 
 	pr_debug("%s: ctrl=%p ndx=%d\n", __func__, ctrl, ctrl->ndx);
+
+	if (pinfo->partial_update_dcs_cmd_by_left) {
+		if (ctrl->ndx != DSI_CTRL_LEFT)
+			goto end;
+	}
 
 	if (ctrl->on_cmds.cmd_cnt)
 		mdss_dsi_panel_cmds_send(ctrl, &ctrl->on_cmds);
 
+#ifdef CONFIG_MACH_OPPO
+	if (ctrl->calibration_available && ctrl->calibration_cmds.cmd_cnt)
+		mdss_dsi_panel_cmds_send(ctrl, &ctrl->calibration_cmds);
+
+    mdss_dsi_update_gamma_index(ctrl);
+	mdss_dsi_update_color_enhance(ctrl);
+
+	mdss_dsi_update_cabc_level(ctrl);
+#endif
+
+end:
+	pinfo->blank_state = MDSS_PANEL_BLANK_UNBLANK;
 	pr_debug("%s:-\n", __func__);
 	return 0;
 }
 
 static int mdss_dsi_panel_off(struct mdss_panel_data *pdata)
 {
-	struct mipi_panel_info *mipi;
 	struct mdss_dsi_ctrl_pdata *ctrl = NULL;
 
 	if (pdata == NULL) {
@@ -428,15 +973,49 @@ static int mdss_dsi_panel_off(struct mdss_panel_data *pdata)
 		return -EINVAL;
 	}
 
+	pinfo = &pdata->panel_info;
 	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
 
 	pr_debug("%s: ctrl=%p ndx=%d\n", __func__, ctrl, ctrl->ndx);
 
-	mipi  = &pdata->panel_info.mipi;
+	if (pinfo->partial_update_dcs_cmd_by_left) {
+		if (ctrl->ndx != DSI_CTRL_LEFT)
+			goto end;
+	}
 
 	if (ctrl->off_cmds.cmd_cnt)
 		mdss_dsi_panel_cmds_send(ctrl, &ctrl->off_cmds);
+
+end:
+	pinfo->blank_state = MDSS_PANEL_BLANK_BLANK;
+	pr_debug("%s:-\n", __func__);
+	return 0;
+}
+
+static int mdss_dsi_panel_low_power_config(struct mdss_panel_data *pdata,
+	int enable)
+{
+	struct mdss_dsi_ctrl_pdata *ctrl = NULL;
+	struct mdss_panel_info *pinfo;
+
+	if (pdata == NULL) {
+		pr_err("%s: Invalid input data\n", __func__);
+		return -EINVAL;
+	}
+
+	pinfo = &pdata->panel_info;
+	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
+				panel_data);
+
+	pr_debug("%s: ctrl=%p ndx=%d enable=%d\n", __func__, ctrl, ctrl->ndx,
+		enable);
+
+	/* Any panel specific low power commands/config */
+	if (enable)
+		pinfo->blank_state = MDSS_PANEL_BLANK_LOW_POWER;
+	else
+		pinfo->blank_state = MDSS_PANEL_BLANK_UNBLANK;
 
 	pr_debug("%s:-\n", __func__);
 	return 0;
@@ -1483,6 +2062,7 @@ int mdss_dsi_panel_init(struct device_node *node,
 
 	ctrl_pdata->on = mdss_dsi_panel_on;
 	ctrl_pdata->off = mdss_dsi_panel_off;
+	ctrl_pdata->low_power_config = mdss_dsi_panel_low_power_config;
 	ctrl_pdata->panel_data.set_backlight = mdss_dsi_panel_bl_ctrl;
 
 #if defined(CONFIG_MDSS_DSI_EVENT_HANDLER_PANEL)

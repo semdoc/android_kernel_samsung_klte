@@ -389,8 +389,28 @@ static void mdss_mdp_perf_mixer_update(struct mdss_mdp_mixer *mixer,
 		 *clk_rate, *bus_ab_quota, *bus_ib_quota);
 }
 
-#define ADDING_BW_ROTATE_MODE 130
-#define ADDING_BW_LANDSCAPE_MODE 107
+static u32 mdss_mdp_get_vbp_factor_max(struct mdss_mdp_ctl *ctl)
+{
+	u32 vbp_max = 0;
+	int i;
+	struct mdss_data_type *mdata;
+
+	if (!ctl || !ctl->mdata)
+		return 0;
+
+	mdata = ctl->mdata;
+	for (i = 0; i < mdata->nctl; i++) {
+		struct mdss_mdp_ctl *ctl = mdata->ctl_off + i;
+		u32 vbp_fac;
+
+		if (mdss_mdp_ctl_is_power_on(ctl)) {
+			vbp_fac = mdss_mdp_get_vbp_factor(ctl);
+			vbp_max = max(vbp_max, vbp_fac);
+		}
+	}
+
+	return vbp_max;
+}
 
 static int mdss_mdp_ctl_perf_update(struct mdss_mdp_ctl *ctl)
 {
@@ -439,14 +459,88 @@ static int mdss_mdp_ctl_perf_update(struct mdss_mdp_ctl *ctl)
 		ctl->perf_changed |= MDSS_MDP_PERF_UPDATE_CLK;
 	}
 
-	if ((total_ab_quota != ctl->bus_ab_quota) ||
-			(total_ib_quota != ctl->bus_ib_quota)) {
-		if (ret == MDSS_MDP_PERF_UPDATE_SKIP) {
-			if (total_ib_quota >= ctl->bus_ib_quota)
-				ret = MDSS_MDP_PERF_UPDATE_EARLY;
-			else
-				ret = MDSS_MDP_PERF_UPDATE_LATE;
+	spin_lock_irqsave(&ctl->spin_lock, flags);
+	transaction_status = ctl->perf_transaction_status;
+	spin_unlock_irqrestore(&ctl->spin_lock, flags);
+
+	return transaction_status;
+}
+
+static inline void mdss_mdp_ctl_perf_update_bus(struct mdss_mdp_ctl *ctl)
+{
+	u64 bw_sum_of_intfs = 0;
+	u64 bus_ab_quota, bus_ib_quota;
+	struct mdss_data_type *mdata;
+	int i;
+
+	if (!ctl || !ctl->mdata)
+		return;
+	ATRACE_BEGIN(__func__);
+	mdata = ctl->mdata;
+	for (i = 0; i < mdata->nctl; i++) {
+		struct mdss_mdp_ctl *ctl;
+		ctl = mdata->ctl_off + i;
+		if (mdss_mdp_ctl_is_power_on(ctl)) {
+			bw_sum_of_intfs += ctl->cur_perf.bw_ctl;
+			pr_debug("c=%d bw=%llu\n", ctl->num,
+				ctl->cur_perf.bw_ctl);
 		}
+	}
+	bus_ib_quota = max(bw_sum_of_intfs, mdata->perf_tune.min_bus_vote);
+	bus_ab_quota = apply_fudge_factor(bus_ib_quota,
+		&mdss_res->ab_factor);
+	trace_mdp_perf_update_bus(bus_ab_quota, bus_ib_quota);
+	ATRACE_INT("bus_quota", bus_ib_quota);
+	mdss_bus_scale_set_quota(MDSS_HW_MDP, bus_ab_quota, bus_ib_quota);
+	pr_debug("ab=%llu ib=%llu\n", bus_ab_quota, bus_ib_quota);
+	ATRACE_END(__func__);
+}
+
+/**
+ * @mdss_mdp_ctl_perf_release_bw() - request zero bandwidth
+ * @ctl - pointer to a ctl
+ *
+ * Function checks a state variable for the ctl, if all pending commit
+ * requests are done, meaning no more bandwidth is needed, release
+ * bandwidth request.
+ */
+void mdss_mdp_ctl_perf_release_bw(struct mdss_mdp_ctl *ctl)
+{
+	int transaction_status;
+	struct mdss_data_type *mdata;
+	int i;
+
+	/* only do this for command panel */
+	if (!ctl || !ctl->mdata || !ctl->panel_data ||
+		(ctl->panel_data->panel_info.type != MIPI_CMD_PANEL))
+		return;
+
+	mutex_lock(&mdss_mdp_ctl_lock);
+	mdata = ctl->mdata;
+	/*
+	 * If video interface present, cmd panel bandwidth cannot be
+	 * released.
+	 */
+	for (i = 0; i < mdata->nctl; i++) {
+		struct mdss_mdp_ctl *ctl_local = mdata->ctl_off + i;
+
+		if (mdss_mdp_ctl_is_power_on(ctl_local) &&
+			ctl_local->is_video_mode)
+			goto exit;
+	}
+
+	transaction_status = mdss_mdp_ctl_perf_get_transaction_status(ctl);
+	pr_debug("transaction_status=0x%x\n", transaction_status);
+
+	/*Release the bandwidth only if there are no transactions pending*/
+	if (!transaction_status && mdata->enable_bw_release) {
+		/*
+		 * for splitdisplay if release_bw is called using secondary
+		 * then find the main ctl and release BW for main ctl because
+		 * BW is always calculated/stored using main ctl.
+		 */
+		struct mdss_mdp_ctl *ctl_local =
+			mdss_mdp_get_main_ctl(ctl) ? : ctl;
 
 		if (ctl->mixer_left) {
 			for (i = 0; i < MDSS_MDP_MAX_STAGE; i++) {
@@ -480,10 +574,31 @@ static int mdss_mdp_ctl_perf_update(struct mdss_mdp_ctl *ctl)
 						display_height += pipe->src.h;
 						need_more_bw = 1;
 
-						if (pipe->flags & MDP_ROT_90)
-							rotate_mode = 1;
-					}
-			}
+	if (mdss_mdp_ctl_is_power_on(ctl)) {
+		if (ctl->perf_release_ctl_bw &&
+			mdata->enable_rotator_bw_release)
+			mdss_mdp_perf_release_ctl_bw(ctl, new);
+		else if (is_bw_released || params_changed)
+			mdss_mdp_perf_calc_ctl(ctl, new);
+		/*
+		 * if params have just changed delay the update until
+		 * later once the hw configuration has been flushed to
+		 * MDP
+		 */
+		if ((params_changed && (new->bw_ctl > old->bw_ctl)) ||
+		    (!params_changed && (new->bw_ctl < old->bw_ctl))) {
+			pr_debug("c=%d p=%d new_bw=%llu,old_bw=%llu\n",
+				ctl->num, params_changed, new->bw_ctl,
+				old->bw_ctl);
+			old->bw_ctl = new->bw_ctl;
+			update_bus = 1;
+		}
+
+		if ((params_changed && (new->mdp_clk_rate > old->mdp_clk_rate))
+		    || (!params_changed && (new->mdp_clk_rate <
+					    old->mdp_clk_rate))) {
+			old->mdp_clk_rate = new->mdp_clk_rate;
+			update_clk = 1;
 		}
 
 		if (need_more_bw) {
@@ -513,9 +628,12 @@ static int mdss_mdp_ctl_perf_update(struct mdss_mdp_ctl *ctl)
 					pr_debug("add 7%c more bw",'%');
 				}
 
-				total_ab_quota /= 100;
-				total_ib_quota /= 100;
-			}
+		for (i = 0; i < mdata->nctl; i++) {
+			struct mdss_mdp_ctl *ctl;
+			ctl = mdata->ctl_off + i;
+			if (mdss_mdp_ctl_is_power_on(ctl))
+				clk_rate = max(ctl->cur_perf.mdp_clk_rate,
+					       clk_rate);
 		}
 
 		ctl->bus_ab_quota = total_ab_quota;
@@ -579,7 +697,7 @@ static int mdss_mdp_ctl_free(struct mdss_mdp_ctl *ctl)
 	ctl->intf_num = MDSS_MDP_NO_INTF;
 	ctl->intf_type = MDSS_MDP_NO_INTF;
 	ctl->is_secure = false;
-	ctl->power_on = false;
+	ctl->power_state = MDSS_PANEL_POWER_OFF;
 	ctl->start_fnc = NULL;
 	ctl->stop_fnc = NULL;
 	ctl->prepare_fnc = NULL;
@@ -727,7 +845,7 @@ struct mdss_mdp_mixer *mdss_mdp_wb_mixer_alloc(int rotator)
 	ctl->mixer_left = mixer;
 
 	ctl->start_fnc = mdss_mdp_writeback_start;
-	ctl->power_on = true;
+	ctl->power_state = MDSS_PANEL_POWER_ON;
 	ctl->wb_type = (rotator ? MDSS_MDP_WB_CTL_TYPE_BLOCK :
 			MDSS_MDP_WB_CTL_TYPE_LINE);
 	mixer->ctl = ctl;
@@ -760,7 +878,7 @@ int mdss_mdp_wb_mixer_destroy(struct mdss_mdp_mixer *mixer)
 	pr_debug("destroy ctl=%d mixer=%d\n", ctl->num, mixer->num);
 
 	if (ctl->stop_fnc)
-		ctl->stop_fnc(ctl);
+		ctl->stop_fnc(ctl, MDSS_PANEL_POWER_OFF);
 
 	mdss_mdp_ctl_free(ctl);
 
@@ -1252,6 +1370,54 @@ int mdss_mdp_ctl_intf_event(struct mdss_mdp_ctl *ctl, int event, void *arg)
 	return rc;
 }
 
+static void mdss_mdp_ctl_restore_sub(struct mdss_mdp_ctl *ctl)
+{
+	u32 temp;
+
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
+	temp = readl_relaxed(ctl->mdata->mdp_base +
+		MDSS_MDP_REG_DISP_INTF_SEL);
+	temp |= (ctl->intf_type << ((ctl->intf_num - MDSS_MDP_INTF0) * 8));
+	writel_relaxed(temp, ctl->mdata->mdp_base +
+		MDSS_MDP_REG_DISP_INTF_SEL);
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
+}
+
+/*
+ * mdss_mdp_ctl_restore() - restore mdp ctl path
+ *
+ * This function is called whenever MDP comes out of a power collapse as
+ * a result of a screen update. It restores the MDP controller's software
+ * state to the hardware registers.
+ */
+void mdss_mdp_ctl_restore(void)
+{
+	struct mdss_mdp_ctl *ctl = NULL;
+	struct mdss_mdp_ctl *sctl;
+	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
+	u32 cnum;
+
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
+	for (cnum = MDSS_MDP_CTL0; cnum < mdata->nctl; cnum++) {
+		ctl = mdata->ctl_off + cnum;
+		if (!mdss_mdp_ctl_is_power_on(ctl))
+			continue;
+
+		pr_debug("restoring ctl%d, intf_type=%d\n", cnum,
+			ctl->intf_type);
+		ctl->play_cnt = 0;
+		sctl = mdss_mdp_get_split_ctl(ctl);
+		mdss_mdp_ctl_restore_sub(ctl);
+		if (sctl) {
+			mdss_mdp_ctl_restore_sub(sctl);
+			mdss_mdp_ctl_split_display_enable(1, ctl, sctl);
+		}
+		if (ctl->restore_fnc)
+			ctl->restore_fnc(ctl);
+	}
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
+}
+
 static int mdss_mdp_ctl_start_sub(struct mdss_mdp_ctl *ctl, bool handoff)
 {
 	struct mdss_mdp_mixer *mixer;
@@ -1312,7 +1478,9 @@ int mdss_mdp_ctl_start(struct mdss_mdp_ctl *ctl, bool handoff)
 	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
 	int ret = 0;
 
-	if (ctl->power_on) {
+	pr_debug("ctl_num=%d, power_state=%d\n", ctl->num, ctl->power_state);
+
+	if (mdss_mdp_ctl_is_power_on_interactive(ctl)) {
 		pr_debug("%d: panel already on!\n", __LINE__);
 		return 0;
 	}
@@ -1325,16 +1493,15 @@ int mdss_mdp_ctl_start(struct mdss_mdp_ctl *ctl, bool handoff)
 
 	mutex_lock(&ctl->lock);
 
+	if (mdss_mdp_ctl_is_power_off(ctl))
+		memset(&ctl->cur_perf, 0, sizeof(ctl->cur_perf));
+
 	/*
 	 * keep power_on false during handoff to avoid unexpected
 	 * operations to overlay.
 	 */
 	if (!handoff)
-		ctl->power_on = true;
-
-	ctl->bus_ab_quota = 0;
-	ctl->bus_ib_quota = 0;
-	ctl->clk_rate = 0;
+		ctl->power_state = MDSS_PANEL_POWER_ON;
 
 	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
 
@@ -1364,28 +1531,28 @@ int mdss_mdp_ctl_start(struct mdss_mdp_ctl *ctl, bool handoff)
 	}
 	mdss_mdp_hist_intr_setup(&mdata->hist_intr, MDSS_IRQ_RESUME);
 
-	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 error:
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 	mutex_unlock(&ctl->lock);
 
 	return ret;
 }
 
-int mdss_mdp_ctl_stop(struct mdss_mdp_ctl *ctl)
+int mdss_mdp_ctl_stop(struct mdss_mdp_ctl *ctl, int power_state)
 {
 	struct mdss_mdp_ctl *sctl;
 	int ret = 0;
 	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
 	u32 off;
 
-	if (!ctl->power_on) {
+	pr_debug("ctl_num=%d, power_state=%d\n", ctl->num, ctl->power_state);
+
+	if (!mdss_mdp_ctl_is_power_on(ctl)) {
 		pr_debug("%s %d already off!\n", __func__, __LINE__);
 		return 0;
 	}
 
 	sctl = mdss_mdp_get_split_ctl(ctl);
-
-	pr_debug("ctl_num=%d\n", ctl->num);
 
 	mutex_lock(&ctl->lock);
 
@@ -1393,40 +1560,52 @@ int mdss_mdp_ctl_stop(struct mdss_mdp_ctl *ctl)
 
 	mdss_mdp_hist_intr_setup(&mdata->hist_intr, MDSS_IRQ_SUSPEND);
 
-	if (ctl->stop_fnc)
-		ret = ctl->stop_fnc(ctl);
-	else
+	if (ctl->stop_fnc) {
+		ret = ctl->stop_fnc(ctl, power_state);
+		if (ctl->panel_data->panel_info.fbc.enabled)
+			mdss_mdp_ctl_fbc_enable(0, ctl->mixer_left,
+				&ctl->panel_data->panel_info);
+	} else {
 		pr_warn("no stop func for ctl=%d\n", ctl->num);
 
 	if (sctl && sctl->stop_fnc) {
-		ret = sctl->stop_fnc(sctl);
-
-		mdss_mdp_ctl_split_display_enable(0, ctl, sctl);
+		ret = sctl->stop_fnc(sctl, power_state);
+		if (ctl->panel_data->panel_info.fbc.enabled)
+			mdss_mdp_ctl_fbc_enable(0, sctl->mixer_left,
+				&sctl->panel_data->panel_info);
 	}
-
 	if (ret) {
 		pr_warn("error powering off intf ctl=%d\n", ctl->num);
-	} else {
-		mdss_mdp_ctl_write(ctl, MDSS_MDP_REG_CTL_TOP, 0);
-		if (sctl)
-			mdss_mdp_ctl_write(sctl, MDSS_MDP_REG_CTL_TOP, 0);
-
-		if (ctl->mixer_left) {
-			off = __mdss_mdp_ctl_get_mixer_off(ctl->mixer_left);
-			mdss_mdp_ctl_write(ctl, off, 0);
-		}
-
-		if (ctl->mixer_right) {
-			off = __mdss_mdp_ctl_get_mixer_off(ctl->mixer_right);
-			mdss_mdp_ctl_write(ctl, off, 0);
-		}
-
-		ctl->power_on = false;
-		ctl->play_cnt = 0;
-		ctl->clk_rate = 0;
-		mdss_mdp_ctl_perf_commit(ctl->mdata, MDSS_MDP_PERF_UPDATE_ALL);
+		goto end;
 	}
 
+	if (mdss_panel_is_power_on(power_state)) {
+		pr_debug("panel is not off, leaving ctl power on\n");
+		goto end;
+	}
+
+	if (sctl)
+		mdss_mdp_ctl_split_display_enable(0, ctl, sctl);
+
+	mdss_mdp_ctl_write(ctl, MDSS_MDP_REG_CTL_TOP, 0);
+	if (sctl)
+		mdss_mdp_ctl_write(sctl, MDSS_MDP_REG_CTL_TOP, 0);
+
+	if (ctl->mixer_left) {
+		off = __mdss_mdp_ctl_get_mixer_off(ctl->mixer_left);
+		mdss_mdp_ctl_write(ctl, off, 0);
+	}
+
+	if (ctl->mixer_right) {
+		off = __mdss_mdp_ctl_get_mixer_off(ctl->mixer_right);
+		mdss_mdp_ctl_write(ctl, off, 0);
+	}
+
+	ctl->power_state = power_state;
+	ctl->play_cnt = 0;
+	mdss_mdp_ctl_perf_update(ctl, 0);
+
+end:
 	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 
 	mutex_unlock(&ctl->lock);
@@ -2012,7 +2191,7 @@ int mdss_mdp_display_wait4comp(struct mdss_mdp_ctl *ctl)
 	if (ret)
 		return ret;
 
-	if (!ctl->power_on) {
+	if (!mdss_mdp_ctl_is_power_on(ctl)) {
 		mutex_unlock(&ctl->lock);
 		return 0;
 	}
@@ -2038,7 +2217,7 @@ int mdss_mdp_display_wait4pingpong(struct mdss_mdp_ctl *ctl)
 	if (ret)
 		return ret;
 
-	if (!ctl->power_on) {
+	if (!mdss_mdp_ctl_is_power_on(ctl)) {
 		mutex_unlock(&ctl->lock);
 		return 0;
 	}
@@ -2074,7 +2253,7 @@ int mdss_mdp_display_commit(struct mdss_mdp_ctl *ctl, void *arg)
 	mutex_lock(&ctl->lock);
 	pr_debug("commit ctl=%d play_cnt=%d\n", ctl->num, ctl->play_cnt);
 
-	if (!ctl->power_on) {
+	if (!mdss_mdp_ctl_is_power_on(ctl)) {
 		mutex_unlock(&ctl->lock);
 		return 0;
 	}
@@ -2177,7 +2356,7 @@ int mdss_mdp_get_ctl_mixers(u32 fb_num, u32 *mixer_id)
 	mdata = mdss_mdp_get_mdata();
 	for (i = 0; i < mdata->nctl; i++) {
 		ctl = mdata->ctl_off + i;
-		if ((ctl->power_on) && (ctl->mfd) &&
+		if ((mdss_mdp_ctl_is_power_on(ctl)) && (ctl->mfd) &&
 			(ctl->mfd->index == fb_num)) {
 			if (ctl->mixer_left) {
 				mixer_id[mixer_cnt] = ctl->mixer_left->num;

@@ -151,7 +151,7 @@ struct mdss_mdp_ctl {
 	char __iomem *base;
 	char __iomem *wb_base;
 	u32 ref_cnt;
-	int power_on;
+	int power_state;
 
 	u32 panel_ndx;
 	u32 intf_num;
@@ -191,7 +191,7 @@ struct mdss_mdp_ctl {
 	u8 roi_changed;
 
 	int (*start_fnc) (struct mdss_mdp_ctl *ctl);
-	int (*stop_fnc) (struct mdss_mdp_ctl *ctl);
+	int (*stop_fnc) (struct mdss_mdp_ctl *ctl, int panel_power_state);
 	int (*prepare_fnc) (struct mdss_mdp_ctl *ctl, void *arg);
 	int (*display_fnc) (struct mdss_mdp_ctl *ctl, void *arg);
 	int (*wait_fnc) (struct mdss_mdp_ctl *ctl, void *arg);
@@ -473,6 +473,27 @@ static inline u32 mdss_mdp_pingpong_read(struct mdss_mdp_mixer *mixer, u32 reg)
 	return readl_relaxed(mixer->pingpong_base + reg);
 }
 
+static inline bool mdss_mdp_ctl_is_power_off(struct mdss_mdp_ctl *ctl)
+{
+	return mdss_panel_is_power_off(ctl->power_state);
+}
+
+static inline bool mdss_mdp_ctl_is_power_on_interactive(
+	struct mdss_mdp_ctl *ctl)
+{
+	return mdss_panel_is_power_on_interactive(ctl->power_state);
+}
+
+static inline bool mdss_mdp_ctl_is_power_on(struct mdss_mdp_ctl *ctl)
+{
+	return mdss_panel_is_power_on(ctl->power_state);
+}
+
+static inline bool mdss_mdp_ctl_is_power_on_lp(struct mdss_mdp_ctl *ctl)
+{
+	return mdss_panel_is_power_on_lp(ctl->power_state);
+}
+
 irqreturn_t mdss_mdp_isr(int irq, void *ptr);
 int mdss_iommu_attach(struct mdss_data_type *mdata);
 int mdss_mdp_scan_cont_splash(void);
@@ -527,7 +548,7 @@ int mdss_mdp_ctl_split_display_setup(struct mdss_mdp_ctl *ctl,
 struct mdss_mdp_ctl *mdss_mdp_get_split_ctl(struct mdss_mdp_ctl *ctl);
 int mdss_mdp_ctl_destroy(struct mdss_mdp_ctl *ctl);
 int mdss_mdp_ctl_start(struct mdss_mdp_ctl *ctl, bool handoff);
-int mdss_mdp_ctl_stop(struct mdss_mdp_ctl *ctl);
+int mdss_mdp_ctl_stop(struct mdss_mdp_ctl *ctl, int panel_power_mode);
 int mdss_mdp_ctl_intf_event(struct mdss_mdp_ctl *ctl, int event, void *arg);
 
 #if defined(CONFIG_FB_MSM_EDP_SAMSUNG)

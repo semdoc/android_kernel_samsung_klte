@@ -1212,9 +1212,18 @@ static int msm_dsi_cont_on(struct mdss_panel_data *pdata)
 
 	pinfo = &pdata->panel_info;
 	mutex_lock(&ctrl_pdata->mutex);
-	ret = msm_dss_enable_vreg(
-		ctrl_pdata->power_data.vreg_config,
-		ctrl_pdata->power_data.num_vreg, 1);
+	for (i = 0; !ret && (i < DSI_MAX_PM); i++) {
+		ret = msm_dss_enable_vreg(
+			ctrl_pdata->power_data[i].vreg_config,
+			ctrl_pdata->power_data[i].num_vreg, 1);
+		if (ret) {
+			pr_err("%s: failed to enable vregs for %s\n",
+				__func__, __mdss_dsi_pm_name(i));
+			goto error_vreg;
+		}
+	}
+	pinfo->panel_power_state = MDSS_PANEL_POWER_ON;
+	ret = mdss_dsi_panel_reset(pdata, 1);
 	if (ret) {
 		pr_err("%s: DSI power on failed\n", __func__);
 		mutex_unlock(&ctrl_pdata->mutex);
